@@ -1,0 +1,14 @@
+# Go build output
+/efferent
+/agenthook/agenthook
+/lpdiag
+
+# Local
+.env
+.cache/
+
+# Claude Code hook wiring holds absolute paths on the author's machine; see
+# README.md for the example to copy.
+.claude/settings.json
+.claude/settings.local.json
+.plancheck-debug.json

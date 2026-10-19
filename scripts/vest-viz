@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# vest-viz: a live view of exactly what's on the wire to the vest right
+# now -- vest_frame.json (vest.go's writeFrame/recordVizFrame) is written
+# on every real WriteWithoutResponse call the daemon makes, throttled to
+# vestVizMinInterval, so this shows the actual last frame sent, not a
+# guess at what a signal *should* be doing. The three questions this
+# answers at a glance, top to bottom:
+#   1. which build is running, and how long ago it was built
+#   2. is anything driving the vest RIGHT NOW (fresh write vs stale file)
+#   3. the exact 0-15 value on every motor, laid out as the vest is worn
+#
+# Layout: four columns, one per physical motor group, arranged as the
+# vest sits on your body -- FRONT pair on the left, BACK pair on the
+# right, your left on the left in both. Row 0 is the top of each column
+# (shoulder), row 9 the bottom (hem). Motor index = column base + row,
+# and each cell prints its absolute index in grey so no arithmetic is
+# needed to name a motor. Each cell is: index, an 8-char bar (1 step per
+# half-block, so all 16 levels are distinct), the exact decimal value,
+# and a change marker vs the previous poll.
+#
+# Forks per tick: exactly ONE (jq), because fork/exec contention shows up
+# as visible redraw jank (see fleet-legend-tui). One jq call
+# extracts everything (including both date parses, so no `date` forks);
+# the 16 possible cell renderings are precomputed into arrays once;
+# the screen clear is an escape sequence rather than /usr/bin/clear; and
+# the inter-tick sleep is a `read -t` on a self-piped fd rather than
+# /bin/sleep. Everything else is bash builtins and parameter expansion.
+#
+# Redraw model: DEC private mode 2026 (synchronized output) around a full
+# clear + redraw each tick, same as fleet-legend-tui -- see its header
+# for why cursor-diffing approaches broke here (pane resizes, wrapping).
+set -euo pipefail
+
+state="${XDG_STATE_HOME:-$HOME/.local/state}/efferent/vest_frame.json"
+poll=1            # seconds between reads of $state (the daemon writes at <=10Hz) --
+                  # slower than the write rate on purpose: a full-screen clear
+                  # and redraw faster than about 1/s reads as blinking even
+                  # painted atomically (mode 2026 prevents a blank frame, not
+                  # fast churn); this tool is for reading state, not scoping
+                  # a signal edge.
+stale_ms=2000     # no write for longer than this => nothing is driving the vest
+newbuild_ms=15000 # how long to flag a build-tag change after first seeing it
+
+# The one jq call per tick. Both top-level terms are parenthesized on
+# purpose: jq's `|` binds looser than `,`, so an unparenthesized
+# `A | @tsv, B | @tsv` silently feeds B the output of A instead of the
+# original document. Line 1: build tag, timestamp,
+# timestamp as epoch seconds, build stamp as epoch seconds (-1 when the
+# tag carries no stamp, e.g. "nogit"). Line 2: the 40 motor values.
+filter='([.build, .timestamp,
+          (.timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601),
+          ((.build | capture("(?<d>[0-9]{8}T[0-9]{6}Z)$") | .d
+                   | strptime("%Y%m%dT%H%M%SZ") | mktime) // -1)] | @tsv),
+        (.motors | @tsv)'
+
+reset=$'\033[0m'
+bold=$'\033[1m'
+c_dark=$'\033[38;5;240m'  # off motor, empty bar, motor indices
+c_grey=$'\033[38;5;245m'  # the whole grid when stale: last-known, not live
+c_cyan=$'\033[38;5;44m'   # 1-3
+c_amber=$'\033[38;5;220m' # 4-7
+c_orange=$'\033[38;5;208m' # 8-11
+c_red=$'\033[1;38;5;196m' # 12-15
+c_live=$'\033[1;30;42m'   # black on green
+c_stale=$'\033[1;97;41m'  # white on red
+c_stale_fg=$'\033[1;38;5;196m'
+c_warn=$'\033[1;30;43m'   # black on yellow
+c_new=$'\033[1;30;45m'    # black on magenta: build tag changed
+up=$'\033[1;97m'"▲$reset"
+down=$'\033[2m'"▼$reset"
+spinner=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# build_tables precomputes the bar and number rendering for every value
+# 0-15 so the per-cell work in render is two array lookups. $1=1 swaps in
+# the all-grey stale palette so a stale grid reads as history, not live.
+declare -a cell_bar cell_num
+build_tables() {
+	local stale=$1 v c k bar pad
+	for ((v = 0; v <= 15; v++)); do
+		if ((stale)); then
+			c=$c_grey
+		elif ((v == 0)); then
+			c=$c_dark
+		elif ((v <= 3)); then
+			c=$c_cyan
+		elif ((v <= 7)); then
+			c=$c_amber
+		elif ((v <= 11)); then
+			c=$c_orange
+		else
+			c=$c_red
+		fi
+		bar=""
+		for ((k = 0; k < v / 2; k++)); do bar+="█"; done
+		if ((v % 2)); then bar+="▌"; fi
+		pad=""
+		for ((k = v / 2 + v % 2; k < 8; k++)); do pad+="·"; done
+		cell_bar[v]="${c}${bar}${c_dark}${pad}${reset}"
+		printf -v "cell_num[$v]" '%s%2d%s' "$c" "$v" "$reset"
+	done
+}
+
+# fmt_dur sets $_dur to a short human duration for a millisecond count.
+fmt_dur() {
+	local ms=$1
+	((ms < 0)) && ms=0
+	if ((ms < 10000)); then
+		printf -v _dur '%d.%02ds' $((ms / 1000)) $((ms % 1000 / 10))
+	elif ((ms < 60000)); then
+		printf -v _dur '%d.%ds' $((ms / 1000)) $((ms % 1000 / 100))
+	elif ((ms < 3600000)); then
+		printf -v _dur '%dm%02ds' $((ms / 60000)) $((ms % 60000 / 1000))
+	else
+		printf -v _dur '%dh%02dm' $((ms / 3600000)) $((ms % 3600000 / 60000))
+	fi
+	return 0
+}
+
+# out appends a formatted segment to the tick's frame buffer instead of
+# printing directly. Many separate printf calls between the sync-mode
+# begin/end markers let wall-clock time elapse between writes, which gives
+# the terminal a window to paint the just-cleared screen before the content
+# arrives, a blink that tracks the tick regardless of poll rate. One printf
+# per tick instead -- see the main loop.
+# Fork-free: printf -v is a builtin.
+out() {
+	local seg
+	printf -v seg "$@"
+	frame+=$seg
+}
+
+# now_ms sets $_now_ms from bash's EPOCHREALTIME builtin. No fork.
+now_ms() {
+	local t=$EPOCHREALTIME
+	_now_ms=$((${t%.*} * 1000 + 10#${t#*.} / 1000))
+}
+
+# read_frame reads $state with the single jq call and, if the result is
+# well-formed, replaces the current frame (build, ts, ts_epoch,
+# build_epoch, motors[40]). Sets ok=1 on success, ok=0 otherwise, leaving
+# the previous frame in place so a bad tick shows the last good frame
+# rather than crashing under `set -u`. writeJSON renames atomically so a
+# torn read should never happen, but jq did once fail mid-write before
+# that fix and this is cheap insurance.
+motors_re=$'^[0-9]+(\t[0-9]+){39}$'
+read_frame() {
+	local nb nt ne nbe mline
+	ok=0
+	{
+		IFS=$'\t' read -r nb nt ne nbe || return 0
+		IFS= read -r mline || return 0
+	} < <(jq -r "$filter" "$state" 2>/dev/null)
+	[[ $ne =~ ^[0-9]+$ && $nbe =~ ^-?[0-9]+$ ]] || return 0
+	[[ $mline =~ $motors_re ]] || return 0
+	build=$nb ts=$nt ts_epoch=$ne build_epoch=$nbe
+	IFS=$'\t' read -ra motors <<<"$mline"
+	ok=1
+}
+
+# term_width sets COLUMNS from the controlling tty (one stty fork), or 80
+# when there is no tty (e.g. output redirected to a log). Called once at
+# startup and again only after a SIGWINCH -- never per tick.
+term_width() {
+	local l c
+	if read -r l c < <(stty size 2>/dev/null </dev/tty) && [[ $c =~ ^[0-9]+$ ]]; then
+		COLUMNS=$c
+	else
+		COLUMNS=80
+	fi
+}
+
+render() {
+	local wide=1
+	((COLUMNS < 72)) && wide=0
+
+	# --- line 1: what's running -------------------------------------
+	local hash=$build dirty=""
+	if [[ $build =~ ^([^-]+)(-dirty)?-[0-9]{8}T[0-9]{6}Z$ ]]; then
+		hash=${BASH_REMATCH[1]}
+		dirty=${BASH_REMATCH[2]}
+	fi
+	local built=""
+	if ((build_epoch >= 0)); then
+		fmt_dur $((_now_ms - build_epoch * 1000))
+		built=" · built $_dur ago"
+	fi
+	out ' %sefferent vest%s   build %s%s%s%s%s' \
+		"$bold" "$reset" "$bold" "$hash" "$reset" \
+		"${dirty:+ ${c_amber}dirty${reset}}" "$built"
+	if ((newbuild_at > 0 && _now_ms - newbuild_at < newbuild_ms)); then
+		fmt_dur $((_now_ms - newbuild_at))
+		out '   %s ↻ NEW BUILD %s %s ago' "$c_new" "$reset" "$_dur"
+	fi
+	out '\n'
+
+	# --- line 2: is anything driving it -----------------------------
+	local on=0 sum=0 peak=0 v g i m
+	local -a gon=(0 0 0 0) gsum=(0 0 0 0)
+	local -a bases=(0 30 10 20)
+	for ((g = 0; g < 4; g++)); do
+		for ((i = 0; i < 10; i++)); do
+			v=${motors[bases[g] + i]}
+			((v > 15)) && v=15
+			motors[bases[g] + i]=$v
+			if ((v > 0)); then
+				# assignments, not bare `((x++))`: under set -e a bare
+				# arithmetic command whose value is 0 (e.g. the first
+				# post-increment from 0) exits the script.
+				gon[g]=$((gon[g] + 1))
+				on=$((on + 1))
+				gsum[g]=$((gsum[g] + v))
+				sum=$((sum + v))
+				((v > peak)) && peak=$v
+			fi
+		done
+	done
+	fmt_dur "$age_ms"
+	if ((stale)); then
+		out ' %s ✖ STALE  no write for %s %s %snothing driving the vest (daemon idle or gone)%s' \
+			"$c_stale" "$_dur" "$reset" "$c_stale_fg" "$reset"
+	elif ((on == 0)); then
+		out ' %s ● LIVE %s written %s ago %s  all 40 motors off — last frame was silence' \
+			"$c_live" "$reset" "$_dur" "${spinner[spin]}"
+	else
+		out ' %s ● LIVE %s written %s ago %s  %s%d/40 on · peak %d · Σ %d%s' \
+			"$c_live" "$reset" "$_dur" "${spinner[spin]}" "$bold" "$on" "$peak" "$sum" "$reset"
+	fi
+	out '\n'
+
+	# --- line 3: provenance, dim ------------------------------------
+	out ' %sts %s · frame #%d · %d new in last %ss%s\n' \
+		"$c_dark" "$ts" "$frames" "$recent" "$recent_window" "$reset"
+	if ((!ok)); then
+		out ' %s ⚠ frame unreadable this tick — showing the previous one %s\n' "$c_warn" "$reset"
+	fi
+	out '\n'
+
+	# --- the grid ---------------------------------------------------
+	local sep="  ${c_dark}│${reset}  " gap="   "
+	local -a heads=("FRONT-L   0-9" "FRONT-R 30-39" "BACK-L  10-19" "BACK-R  20-29")
+	local cw=15
+	if ((!wide)); then
+		heads=(FL FR BL BR)
+		cw=6
+		gap="  "
+	fi
+	if ((stale)); then
+		out ' %sNOT LIVE — the last frame the vest was sent%s%s · row 0 shoulder, row 9 hem%s\n' \
+			"$c_stale_fg" "$reset" "$c_dark" "$reset"
+	else
+		out ' %sas worn: your left on the left · row 0 = shoulder, row 9 = hem%s\n' "$c_dark" "$reset"
+	fi
+	out ' %s%-*s%s%s%s%-*s%s%s%s%-*s%s%s%s%-*s%s\n' \
+		"$bold" "$cw" "${heads[0]}" "$reset" "$gap" \
+		"$bold" "$cw" "${heads[1]}" "$reset" "$sep" \
+		"$bold" "$cw" "${heads[2]}" "$reset" "$gap" \
+		"$bold" "$cw" "${heads[3]}" "$reset"
+
+	local line cell mark
+	for ((i = 0; i < 10; i++)); do
+		line=" "
+		for ((g = 0; g < 4; g++)); do
+			m=$((bases[g] + i))
+			v=${motors[m]}
+			if ((stale || v == prev[m])); then
+				mark=" "
+			elif ((v > prev[m])); then
+				mark=$up
+			else
+				mark=$down
+			fi
+			if ((wide)); then
+				printf -v cell '%s%2d%s %s %s%s' "$c_dark" "$m" "$reset" "${cell_bar[v]}" "${cell_num[v]}" "$mark"
+			else
+				printf -v cell '%s%2d%s %s%s' "$c_dark" "$m" "$reset" "${cell_num[v]}" "$mark"
+			fi
+			line+=$cell
+			case $g in
+			0 | 2) line+=$gap ;;
+			1) line+=$sep ;;
+			esac
+		done
+		out '%s\n' "$line"
+	done
+
+	# --- per-column totals ------------------------------------------
+	local -a foot
+	for ((g = 0; g < 4; g++)); do
+		if ((wide)); then
+			printf -v 'foot[g]' '%d/10 on · Σ%d' "${gon[g]}" "${gsum[g]}"
+		else
+			printf -v 'foot[g]' 'Σ%-3d' "${gsum[g]}"
+		fi
+	done
+	out ' %s%-*s%s%-*s%s%-*s%s%-*s%s\n' \
+		"$c_dark" "$cw" "${foot[0]}" "$gap" "$cw" "${foot[1]}" "$sep$c_dark" "$cw" "${foot[2]}" "$gap" "$cw" "${foot[3]}" "$reset"
+	if ((wide)); then
+		out '\n %svalues: the raw 0-15 nibble on the wire · bar ▌ = 1 step, █ = 2 steps%s\n' "$c_dark" "$reset"
+		out ' %s▲▼ changed since last poll (%ss) · STALE = no write for >%ds%s\n' \
+			"$c_dark" "$poll" $((stale_ms / 1000)) "$reset"
+	fi
+}
+
+# --- main loop -------------------------------------------------------
+cleanup() { printf '\033[?2026l\033[?25h\033[0m\n'; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+winch=1
+trap 'winch=1' WINCH
+printf '\033[?25l' # hide the cursor for the life of the loop
+
+# Fork-free sleep: a fd opened read-write on a pipe never sees EOF, so
+# `read -t` on it blocks for exactly the timeout. Verified at startup;
+# if the trick somehow returns early (would otherwise busy-loop), fall
+# back to /bin/sleep.
+exec {tick_fd}<> <(:)
+nap() { read -t "$1" -u "$tick_fd" -r _ || true; }
+now_ms
+t0=$_now_ms
+nap 0.05
+now_ms
+if ((_now_ms - t0 < 40)); then
+	nap() { sleep "$1"; }
+fi
+
+build="" ts="" ts_epoch=0 build_epoch=-1 ok=0
+declare -a motors=() prev=()
+for ((i = 0; i < 40; i++)); do prev[i]=0; done
+frames=0 spin=0 recent=0 stale=0 last_stale=-1 newbuild_at=0
+last_ts="" last_build=""
+declare -a ring=(0 0 0 0 0 0 0 0 0 0)
+# recent_window is ring's size * poll, in seconds -- computed once (a
+# startup-only fork, same allowance as term_width's stty call) rather than
+# hardcoded, so a future poll change can't silently leave the "N new in
+# last Xs" label lying about the window it's actually measuring.
+recent_window=$(awk -v n="${#ring[@]}" -v p="$poll" 'BEGIN { printf "%g", n * p }')
+tick=0
+build_tables 0
+
+while true; do
+	if ((winch)); then
+		winch=0
+		term_width
+	fi
+	frame=""
+	if [[ ! -f "$state" ]]; then
+		out '%s\n' "waiting for $state -- has the vest connected since the daemon started?"
+	else
+		ring[tick % 10]=0
+		read_frame
+		if ((ok)); then
+			if [[ $ts != "$last_ts" ]]; then
+				frames=$((frames + 1))
+				spin=$(((spin + 1) % 10))
+				ring[tick % 10]=1
+				last_ts=$ts
+			fi
+			if [[ -n $last_build && $build != "$last_build" ]]; then
+				now_ms
+				newbuild_at=$_now_ms
+			fi
+			last_build=$build
+		fi
+		if [[ -z $ts ]]; then
+			out '%s\n' "waiting for a readable frame in $state"
+		else
+			recent=0
+			for r in "${ring[@]}"; do recent=$((recent + r)); done
+			now_ms
+			frac=${ts#*.}
+			[[ $frac == "$ts" ]] && frac=0 # RFC3339Nano omits a zero fraction
+			frac=${frac%Z}000
+			age_ms=$((_now_ms - (ts_epoch * 1000 + 10#${frac:0:3})))
+			stale=0
+			((age_ms > stale_ms)) && stale=1
+			if ((stale != last_stale)); then
+				build_tables "$stale"
+				last_stale=$stale
+			fi
+			render
+			prev=("${motors[@]}")
+		fi
+		tick=$((tick + 1))
+	fi
+	printf '\033[?2026h\033[H\033[2J%s\033[?2026l' "$frame" # one write for the whole tick
+	nap "$poll"
+done

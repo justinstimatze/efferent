@@ -1,0 +1,640 @@
+#!/usr/bin/env bash
+# fleet-legend-tui: a live terminal mirror of efferent's Launchpad fleet
+# grid (fleet_legend.json) for when you're not looking at the device --
+# a spatial 8x8 picture matching the physical pad layout, with each
+# session's name in its cell and the colors the pads actually show, plus
+# a legend for every control button. Read-only: never touches the
+# Launchpad or any of the daemon's actuators, just the JSON snapshot
+# fleetLoop (fleet_panel.go) already writes on every poll tick.
+#
+#   fleet-legend-tui              live view; `?` flips to the button
+#                                 descriptions page, `q` quits
+#   fleet-legend-tui --describe   print the full description of every
+#                                 control button and reserved pad, once
+#   fleet-legend-tui --once       draw one frame and exit
+#
+# Layout facts baked in here, not derived (they are fixed hardware/protocol
+# constants, see launchpad.go): row 1 is the bottom row on the real device,
+# closest to you; col 1 is the leftmost column; the top row (8 buttons) is
+# a control row, not session pads -- negotiation.go's panel (hold, a
+# self-report row, a turn-rating pair). Three grid cells are reserved and
+# never hold a session: pad(1,8), bottom-right, jumps to this pane; pad(1,7),
+# one left of it, un-zooms and re-tiles the cockpit; and an 8-cell block at
+# (7-8,1-4), top-left, is the fleet-wide gauge.
+#
+# Height is budgeted against the real terminal: the terminal size is read
+# once at startup and on SIGWINCH (one stty fork, never per tick), and the
+# frame is composed against it -- header + the 8 grid rows are the floor and
+# never get cut; the control-row labels, column numbers, and color key are
+# added back in that priority order only while rows remain. There is no
+# per-session table: every cell already names its own session. The
+# full-sentence descriptions are not on the live view at all: `?` swaps in a
+# descriptions page (word-wrapped to the pane, bounded the same way), and
+# --describe dumps them to stdout. Every line is built to fit the column
+# count so nothing wraps.
+#
+# One jq call and zero per-cell subshell forks by design: on a box running
+# a dozen concurrent Claude Code sessions, fork/exec contention shows up as
+# visible redraw jank. Parse once into bash arrays; helpers set a global var
+# directly instead of being called via $(...), which would fork each time.
+# The screen clear is an escape sequence (not /usr/bin/clear) and the
+# inter-tick wait is a `read -t` (not /bin/sleep), so a tick is exactly one
+# fork: jq.
+#
+# Redraw model: DEC private mode 2026 (synchronized output) around a full
+# clear + redraw each tick. Cursor-home overwrite-in-place approaches break
+# when the pane resizes mid-cycle, and when a line wraps onto extra physical
+# rows (how much it wraps depends on content length, not just terminal
+# width). Mode 2026 (tmux 3.4+) tells the terminal to buffer every write
+# between the begin/end markers and paint it as one atomic frame, without
+# the visible blank-frame flicker of a plain clear. If the attached terminal
+# doesn't support it, enabling it is a silent no-op and this degrades to
+# plain flicker, never to garbled output.
+set -euo pipefail
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/efferent"
+legend="${FLEET_LEGEND_JSON:-$state_dir/fleet_legend.json}" # override only for testing against a synthetic snapshot
+poll=2         # seconds between redraws -- slower than the daemon's own 1.5s
+               # write cadence on purpose, same reasoning as scripts/vest-viz:
+               # a full-screen clear and redraw faster than the data changes
+               # reads as blinking even painted atomically, and this tool is
+               # for reading a fleet snapshot, not catching a transition.
+stale_after=6  # updated_at older than this many seconds => daemon has stopped writing
+
+# ${#s} must count characters, not bytes, for the padding math below to
+# hold with the few non-ASCII glyphs used (· … ▮ ✖). Only force a locale
+# when the inherited one isn't already UTF-8.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+*[Uu][Tt][Ff]*) ;;
+*) export LC_ALL=C.UTF-8 ;;
+esac
+
+# The one jq call per tick. Three top-level branches, each parenthesized:
+# jq's `|` binds looser than `,`, so an unparenthesized `A | B, C` feeds C
+# the output of A instead of the original document (this bit both this
+# script and scripts/vest-viz on the day they were written). Fields are
+# joined with US (0x1f) rather than tab: tab is IFS whitespace, so `read`
+# collapses a run of tabs and an EMPTY field (phase "", note "") would
+# shift every field after it. Line 1 (H): updated_at, updated_at as epoch
+# seconds (-1 if unparseable; jq's strptime ignores the %z offset, so it
+# is re-applied by hand), legend-pad text, overview-pad text. Then one C
+# line per control-row button in file order (left to right), then one P
+# line per session pad sorted by row then col.
+filter='
+def clean: (. // "" | tostring | gsub("[\t\n\r\u001f]"; " "));
+def epoch:
+  ((.updated_at // "") | sub("\\.[0-9]+"; "")) as $t
+  | try (($t | strptime("%Y-%m-%dT%H:%M:%S%z") | mktime)
+         + (($t | capture("(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})$")
+              | (if .s == "-" then 1 else -1 end)
+                * ((.h | tonumber) * 3600 + (.m | tonumber) * 60)) // 0))
+    catch -1;
+(["H", (.updated_at | clean), epoch, (.legend_pad | clean), (.overview_pad | clean), (.gauge_pad | clean)] | join("\u001f")),
+((.control_row // [])[] | ["C", (.cc | clean), (.label | clean), (.description | clean)] | join("\u001f")),
+((.pads // []) | sort_by(.row, .col)[]
+  | ["P", (.row | clean), (.col | clean), (.session | clean), (.phase | clean), (.note | clean)] | join("\u001f"))
+'
+
+reset=$'\033[0m'
+bold=$'\033[1m'
+c_dim=$'\033[38;5;240m'      # empty pads, chrome
+c_gauge=$'\033[38;5;130m'    # dark orange, like the on-device gauge (colorCore)
+c_grey=$'\033[38;5;245m'     # secondary text
+c_here=$'\033[1;30;47m'      # black-on-white chip: the pane you're in (steady white on the device)
+c_here_fg=$'\033[1;97m'      # same state, as plain text in the session list
+c_work=$'\033[38;5;214m'     # amber: working
+c_wait=$'\033[1;38;5;76m'    # green: finished, waiting on you
+c_stuck=$'\033[1;38;5;196m'  # red: >=3 consecutive errored tool calls
+c_gone=$'\033[38;5;240m'     # dim: pane gone
+c_legend=$'\033[38;5;37m'    # teal, like the legend pad
+c_over=$'\033[38;5;134m'     # purple, like the overview pad
+c_stale=$'\033[1;97;41m'     # white on red
+c_warn=$'\033[1;30;43m'      # black on yellow
+
+# note_color sets $_color for a pad note (the daemon's legendNote). No fork.
+note_color() {
+	case "$1" in
+	"you are here") _color=$c_here ;;
+	working) _color=$c_work ;;
+	"waiting on you") _color=$c_wait ;;
+	gone) _color=$c_gone ;;
+	stuck*) _color=$c_stuck ;;
+	legend) _color=$c_legend ;;
+	overview) _color=$c_over ;;
+	*) _color=$c_grey ;;
+	esac
+	return 0
+}
+
+# ctl_color sets $_color for a control-row label -- the idle color the
+# physical button shows (negotiation.go), keyed on the label because the
+# JSON only describes the color in prose. Unknown labels get grey.
+ctl_color() {
+	case "$1" in
+	HOLD) _color=$'\033[38;5;250m' ;;
+	CALM) _color=$c_legend ;;
+	OK | LANDED) _color=$'\033[38;5;70m' ;;
+	FRAYED) _color=$c_work ;;
+	DONE) _color=$c_grey ;;
+	MISSED) _color=$'\033[38;5;160m' ;;
+	"----" | "") _color=$c_dim ;;
+	*) _color=$c_grey ;;
+	esac
+	return 0
+}
+
+# pad_r sets $_p to $1 right-padded with spaces to $2 columns (truncated
+# if longer). Manual, because bash's printf pads by bytes, not columns,
+# so a multibyte glyph would come out one short.
+pad_r() {
+	local s=$1 w=$2
+	if ((${#s} >= w)); then
+		_p=${s:0:w}
+	else
+		printf -v _p '%s%*s' "$s" $((w - ${#s})) ''
+	fi
+	return 0
+}
+
+# short_name sets $_s to $1 fitted into $2 columns. Full name when it
+# fits. Otherwise sessions often share an org/monorepo prefix
+# (acme-api, acme-web, acme-docs) that a plain truncation collapses into
+# one indistinguishable cell, so the first '-'-separated segment is
+# dropped and the cut marked with a leading "…"; a trailing "…" marks a cut
+# at the end.
+short_name() {
+	local name=$1 w=$2 rest
+	if ((${#name} <= w)); then
+		_s=$name
+		return 0
+	fi
+	rest=${name#*-}
+	if [[ $rest != "$name" && -n $rest ]] && ((${#rest} + 1 <= w)); then
+		_s="…$rest"
+	elif [[ $rest != "$name" && -n $rest ]] && ((w >= 6)); then
+		_s="…${rest:0:w-2}…"
+	elif ((w >= 2)); then
+		_s="${name:0:w-1}…"
+	else
+		_s=${name:0:w}
+	fi
+	return 0
+}
+
+# wrap word-wraps $1 into $_wrapped[] at $2 columns. Splits with `read -a`
+# (no glob expansion); a single word longer than the width is hard-split.
+wrap() {
+	local w=$2 word line=""
+	local -a words
+	_wrapped=()
+	((w < 8)) && w=8
+	read -ra words <<<"$1"
+	for word in "${words[@]}"; do
+		while ((${#word} > w)); do
+			[[ -n $line ]] && _wrapped+=("$line") && line=""
+			_wrapped+=("${word:0:w}")
+			word=${word:w}
+		done
+		if [[ -z $line ]]; then
+			line=$word
+		elif ((${#line} + 1 + ${#word} <= w)); then
+			line+=" $word"
+		else
+			_wrapped+=("$line")
+			line=$word
+		fi
+	done
+	[[ -n $line ]] && _wrapped+=("$line")
+	return 0
+}
+
+# flow lays fixed items out into lines of at most $1 columns: the items
+# are the parallel arrays flow_plain[] (for measuring) and flow_color[]
+# (for printing), joined by $2. Result in $_flowed[].
+flow() {
+	local w=$1 sep=$2 i len=0 line="" first=1
+	_flowed=()
+	for i in "${!flow_plain[@]}"; do
+		if ((first)); then
+			line=" ${flow_color[i]}"
+			len=$((1 + ${#flow_plain[i]}))
+			first=0
+		elif ((len + ${#sep} + ${#flow_plain[i]} <= w)); then
+			line+="$sep${flow_color[i]}"
+			len=$((len + ${#sep} + ${#flow_plain[i]}))
+		else
+			_flowed+=("$line")
+			line=" ${flow_color[i]}"
+			len=$((1 + ${#flow_plain[i]}))
+		fi
+	done
+	((first)) || _flowed+=("$line")
+	return 0
+}
+
+# term_size sets LINES/COLUMNS from the controlling tty (one stty fork),
+# falling back to the environment or 24x80 with no tty. Called once at
+# startup and again only after a SIGWINCH -- never per tick.
+term_size() {
+	local l c
+	if read -r l c < <(stty size 2>/dev/null </dev/tty) && [[ $l =~ ^[0-9]+$ && $c =~ ^[0-9]+$ && $l -gt 0 && $c -gt 0 ]]; then
+		LINES=$l COLUMNS=$c
+	else
+		LINES=${LINES:-24} COLUMNS=${COLUMNS:-80}
+	fi
+}
+
+# read_legend runs the one jq call and, if the header line came back,
+# replaces the current snapshot (updated/epoch/legend_pad/overview_pad,
+# ctl_*[] in file order, pad_*[] sorted by row,col). Returns 1 on a torn
+# or missing file, leaving the previous snapshot in place so a bad tick
+# shows the last good frame with a warning rather than a blank one.
+read_legend() {
+	local kind a b c d e got=0
+	local nu="" ne=-1 nlp="" nop="" ngp=""
+	local -a nr=() nc=() ns=() np=() nn=() ncc=() nl=() nd=()
+	while IFS=$'\x1f' read -r kind a b c d e; do
+		case $kind in
+		H) nu=$a ne=$b nlp=$c nop=$d ngp=$e got=1 ;;
+		C) ncc+=("$a") nl+=("$b") nd+=("$c") ;;
+		P) nr+=("$a") nc+=("$b") ns+=("$c") np+=("$d") nn+=("$e") ;;
+		esac
+	done < <(jq -r "$filter" "$legend" 2>/dev/null)
+	((got)) || return 1
+	[[ $ne =~ ^-?[0-9]+$ ]] || ne=-1
+	updated=$nu epoch=$ne legend_pad=$nlp overview_pad=$nop gauge_pad=$ngp
+	pad_row=("${nr[@]}") pad_col=("${nc[@]}") pad_session=("${ns[@]}") pad_phase=("${np[@]}") pad_note=("${nn[@]}")
+	ctl_cc=("${ncc[@]}") ctl_label=("${nl[@]}") ctl_desc=("${nd[@]}")
+	have=1
+	return 0
+}
+
+# header_line sets $_hdr: bold title, the fleet summary, the snapshot
+# time with its age (or a STALE badge), and right-aligned key hints when
+# there's a keyboard. Plain text is tracked alongside for width.
+header_line() {
+	local title=$1 hint=$2 seg age=-1
+	local sum_p="" sum_c="" stamp_p="" stamp_c="" warn_p="" warn_c=""
+	if ((have)); then
+		seg="   ${#pad_row[@]} session"
+		((${#pad_row[@]} != 1)) && seg+="s"
+		sum_p+=$seg sum_c+="${c_grey}${seg}${reset}"
+		if ((n_wait)); then
+			seg=" · $n_wait waiting on you"
+			sum_p+=$seg sum_c+="${c_wait}${seg}${reset}"
+		fi
+		if ((n_stuck)); then
+			seg=" · $n_stuck stuck"
+			sum_p+=$seg sum_c+="${c_stuck}${seg}${reset}"
+		fi
+		if ((n_gone)); then
+			seg=" · $n_gone gone"
+			sum_p+=$seg sum_c+="${c_gone}${seg}${reset}"
+		fi
+		local hhmmss=${updated:11:8}
+		((epoch > 0)) && age=$((EPOCHSECONDS - epoch))
+		if ((age > stale_after)); then
+			seg=" STALE · last update $hhmmss, ${age}s ago "
+			stamp_p="   $seg" stamp_c="   ${c_stale}${seg}${reset}"
+		elif ((age >= 0)); then
+			seg="   updated $hhmmss (${age}s ago)"
+			stamp_p=$seg stamp_c="${c_grey}${seg}${reset}"
+		else
+			seg="   updated ${updated:-?}"
+			stamp_p=$seg stamp_c="${c_grey}${seg}${reset}"
+		fi
+		if ((!ok)); then
+			seg=" frame unreadable this tick, showing the previous one "
+			warn_p="  $seg" warn_c="  ${c_warn}${seg}${reset}"
+		fi
+	fi
+	# Narrow pane: shed the least important piece first -- a routine
+	# timestamp, then the fleet summary; a STALE badge or a warning stays.
+	local plain colored w=$((COLUMNS - 1))
+	plain=" $title$sum_p$stamp_p$warn_p" colored=" ${bold}${title}${reset}$sum_c$stamp_c$warn_c"
+	if ((${#plain} > w && age >= 0 && age <= stale_after)); then
+		plain=" $title$sum_p$warn_p" colored=" ${bold}${title}${reset}$sum_c$warn_c"
+	fi
+	if ((${#plain} > w)); then
+		plain=" $title$stamp_p$warn_p" colored=" ${bold}${title}${reset}$stamp_c$warn_c"
+	fi
+	if ((${#plain} > w)); then
+		plain=" $title$warn_p" colored=" ${bold}${title}${reset}$warn_c"
+	fi
+	if [[ -n $hint ]] && ((${#plain} + 3 + ${#hint} <= w)); then
+		printf -v seg '%*s' $((w - ${#plain} - ${#hint})) ''
+		colored+="${seg}${c_dim}${hint}${reset}"
+	fi
+	_hdr=$colored
+	return 0
+}
+
+# render_grid composes the live view into L[] against LINES x COLUMNS.
+render_grid() {
+	local hint=""
+	((interactive)) && hint="? buttons · q quit"
+
+	# --- geometry: 4-col row label, 8 cells -----------------------------
+	local label_w=4 cw
+	cw=$(((COLUMNS - 1 - label_w) / 8))
+	((cw > 24)) && cw=24
+	((cw < 5)) && cw=5
+
+	# --- per-cell text/color from the pads, plus the summary counts ------
+	local -a cell_text=() cell_color=()
+	local i k r c note mark w
+	n_wait=0 n_stuck=0 n_gone=0
+	cell_text[7]="legend" cell_color[7]=$c_legend     # pad(1,8): index (1-1)*8 + (8-1)
+	cell_text[6]="overview" cell_color[6]=$c_over     # pad(1,7)
+	for k in 48 49 50 51 56 57 58 59; do              # corePad's 8 cells: rows 7-8, cols 1-4
+		cell_text[k]="gauge" cell_color[k]=$c_gauge
+	done
+	for i in "${!pad_row[@]}"; do
+		r=${pad_row[i]} c=${pad_col[i]}
+		[[ $r =~ ^[1-8]$ && $c =~ ^[1-8]$ ]] || continue
+		k=$(((r - 1) * 8 + c - 1))
+		note=${pad_note[i]}
+		mark=""
+		case $note in
+		"waiting on you") n_wait=$((n_wait + 1)) ;;
+		stuck*)
+			n_stuck=$((n_stuck + 1))
+			mark="✖"
+			[[ $note =~ ([0-9]+) ]] && mark+=${BASH_REMATCH[1]}
+			;;
+		gone) n_gone=$((n_gone + 1)) ;;
+		esac
+		w=$((cw - 1))
+		[[ -n $mark ]] && w=$((w - ${#mark} - 1))
+		short_name "${pad_session[i]}" "$w"
+		cell_text[k]="$_s${mark:+ $mark}"
+		note_color "$note"
+		cell_color[k]=$_color
+	done
+
+	# --- the pieces, built before the budget decides which to keep -------
+	local line cell t
+	local -a grid=() key=()
+
+	# control row: negotiation.go's 8 buttons, physically above row 8
+	line=" ${c_dim}ctl${reset} "
+	for ((c = 0; c < 8; c++)); do
+		t=${ctl_label[c]:-----}
+		[[ -z $t ]] && t="----"
+		pad_r "$t" "$cw"
+		ctl_color "$t"
+		line+="${_color}${t}${reset}${_p:${#t}}"
+	done
+	local ctl_line=$line
+
+	for r in 8 7 6 5 4 3 2 1; do
+		printf -v line ' %d  ' "$r"
+		for ((c = 1; c <= 8; c++)); do
+			k=$(((r - 1) * 8 + c - 1))
+			t=${cell_text[k]:-}
+			if [[ -z $t ]]; then
+				printf -v cell '%s·%s%*s' "$c_dim" "$reset" $((cw - 1)) ''
+			else
+				pad_r "$t" "$cw"
+				cell="${cell_color[k]}${t}${reset}${_p:${#t}}"
+			fi
+			line+=$cell
+		done
+		grid+=("$line")
+	done
+
+	line=" ${c_dim}col${reset} "
+	for ((c = 1; c <= 8; c++)); do
+		pad_r "$c" "$cw"
+		line+="${c_dim}${_p}${reset}"
+	done
+	local cols_line=$line
+
+	# color key, flowed to the width; least important items fall off first
+	flow_plain=(
+		" you are here " "● working" "● waiting on you" "✖ stuck" "· gone"
+		"■ legend / overview / gauge: reserved pads"
+		"row 1 = bottom of the device, nearest you · col 1 = leftmost"
+	)
+	flow_color=(
+		"${c_here} you are here ${reset}" "${c_work}● working${reset}" "${c_wait}● waiting on you${reset}"
+		"${c_stuck}✖ stuck${reset}" "${c_gone}· gone${reset}"
+		"${c_legend}■ legend${reset}${c_dim} / ${reset}${c_over}■ overview${reset}${c_dim} / ${reset}${c_gauge}■ gauge${reset}${c_dim}: reserved pads${reset}"
+		"${c_dim}row 1 = bottom of the device, nearest you · col 1 = leftmost${reset}"
+	)
+	flow $((COLUMNS - 1)) "   "
+	key=("${_flowed[@]}")
+
+	# --- the height budget ---------------------------------------------
+	# header + 8 grid rows are the floor; the control row, column numbers,
+	# and color key are added back in priority order while rows remain.
+	local extra=$((LINES - 9)) show_ctl=0 show_cols=0 sp_head=0 nkey=0 sp_key=0
+	((extra < 0)) && extra=0
+	((extra >= 1)) && show_ctl=1 && extra=$((extra - 1))
+	((extra >= 1)) && show_cols=1 && extra=$((extra - 1))
+	((extra >= 1)) && sp_head=1 && extra=$((extra - 1))
+	if ((extra >= 2 && ${#key[@]} > 0)); then
+		sp_key=1 nkey=${#key[@]}
+		((nkey > extra - 1)) && nkey=$((extra - 1))
+		extra=$((extra - 1 - nkey))
+	fi
+
+	header_line "efferent fleet" "$hint"
+	L=("$_hdr")
+	((sp_head)) && L+=("")
+	((show_ctl)) && L+=("$ctl_line")
+	L+=("${grid[@]}")
+	((show_cols)) && L+=("$cols_line")
+	((sp_key)) && L+=("")
+	((nkey)) && L+=("${key[@]:0:nkey}")
+	return 0
+}
+
+# render_desc composes the descriptions page: every control-row button
+# and both reserved pads, full text word-wrapped to the pane, bounded to
+# LINES with a "+N more lines" tail. $1=1 means unbounded plain dump.
+render_desc() {
+	local dump=${1:-0} hint="" i cc t desc w indent pre j
+	((interactive && !dump)) && hint="? grid · q quit"
+	local width=$((COLUMNS - 1))
+	L=()
+	if ((dump)); then
+		L+=("efferent fleet -- the Launchpad's control buttons and reserved pads")
+	else
+		header_line "efferent fleet · buttons" "$hint"
+		L+=("$_hdr")
+	fi
+	L+=("")
+	L+=(" ${bold}top row${reset}${c_grey} -- the 8 buttons above row 8, left to right${reset}")
+	for i in "${!ctl_cc[@]}"; do
+		cc=${ctl_cc[i]} t=${ctl_label[i]:-----} desc=${ctl_desc[i]:-reserved, dark}
+		[[ -z $t ]] && t="----"
+		pad_r "$t" 8
+		pre="  cc${cc}  "
+		indent=$((${#pre} + 8))
+		ctl_color "$t"
+		pre+="${_color}${t}${reset}${_p:${#t}}"
+		wrap "$desc" $((width - indent))
+		printf -v w '%*s' "$indent" ''
+		for j in "${!_wrapped[@]}"; do
+			if ((j == 0)); then L+=("$pre${_wrapped[j]}"); else L+=("$w${_wrapped[j]}"); fi
+		done
+	done
+	((${#ctl_cc[@]})) || L+=("  ${c_grey}(no control_row in the snapshot)${reset}")
+	L+=("")
+	L+=(" ${bold}reserved pads${reset}${c_grey} -- never a session${reset}")
+	local -a rp_name=("legend" "overview" "gauge") rp_pos=("(1,8)" "(1,7)" "(7-8,1-4)") rp_color=("$c_legend" "$c_over" "$c_gauge")
+	local -a rp_text=("$legend_pad" "$overview_pad" "$gauge_pad")
+	for i in 0 1 2; do
+		pre="  ${rp_pos[i]}  "
+		pad_r "${rp_name[i]}" 10
+		indent=$((${#pre} + 10))
+		pre+="${rp_color[i]}${rp_name[i]}${reset}${_p:${#rp_name[i]}}"
+		wrap "${rp_text[i]:-(not in the snapshot)}" $((width - indent))
+		printf -v w '%*s' "$indent" ''
+		for j in "${!_wrapped[@]}"; do
+			if ((j == 0)); then L+=("$pre${_wrapped[j]}"); else L+=("$w${_wrapped[j]}"); fi
+		done
+	done
+	if ((!dump && ${#L[@]} > LINES)); then
+		local more=$((${#L[@]} - LINES + 1))
+		L=("${L[@]:0:LINES-1}")
+		L+=(" ${c_dim}… +$more more lines: taller pane, or run fleet-legend-tui --describe${reset}")
+	fi
+	return 0
+}
+
+# paint writes L[] as one atomic frame: mode 2026 begin, cursor home +
+# clear, the lines joined by newline with NO trailing newline (a frame of
+# exactly LINES rows would otherwise scroll one row), mode 2026 end.
+paint() {
+	local frame
+	printf -v frame '%s\n' "${L[@]}"
+	printf '\033[?2026h\033[H\033[2J%s\033[?2026l' "${frame%$'\n'}"
+}
+
+usage() {
+	cat <<'EOF'
+usage: fleet-legend-tui [--describe | --once | --help]
+  (no flag)     live view of the Launchpad fleet grid; ? = button descriptions, q = quit
+  -d, --describe  print every control button's and reserved pad's full description, once
+  -1, --once      draw one frame and exit
+EOF
+}
+
+mode=grid
+once=0
+case "${1:-}" in
+"") ;;
+-d | --describe) mode=describe ;;
+-1 | --once) once=1 ;;
+-h | --help)
+	usage
+	exit 0
+	;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac
+
+# --- state ------------------------------------------------------------
+updated="" epoch=-1 legend_pad="" overview_pad="" gauge_pad="" have=0 ok=0
+n_wait=0 n_stuck=0 n_gone=0
+declare -a pad_row=() pad_col=() pad_session=() pad_phase=() pad_note=()
+declare -a ctl_cc=() ctl_label=() ctl_desc=()
+declare -a L=() flow_plain=() flow_color=() _flowed=() _wrapped=()
+_color="" _p="" _s="" _hdr=""
+interactive=0
+
+if [[ $mode == describe ]]; then
+	# One-shot dump: no colors unless stdout is a terminal, no bound.
+	if [[ ! -t 1 ]]; then
+		reset="" bold="" c_dim="" c_gauge="" c_grey="" c_legend="" c_over="" c_work="" c_wait="" c_stuck="" c_gone="" c_here="" c_here_fg=""
+		ctl_color() { _color=""; }
+		note_color() { _color=""; }
+	fi
+	term_size
+	[[ -t 1 ]] || COLUMNS=100
+	if [[ ! -f $legend ]]; then
+		echo "no $legend -- is efferent.service running?" >&2
+		exit 1
+	fi
+	read_legend || { echo "could not parse $legend" >&2; exit 1; }
+	render_desc 1
+	printf '%s\n' "${L[@]}"
+	exit 0
+fi
+
+# --- main loop --------------------------------------------------------
+cleanup() {
+	printf '\033[?2026l\033[?25h\033[0m\n'
+	((interactive)) && stty icanon echo 2>/dev/null </dev/tty
+	return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+winch=1
+trap 'winch=1' WINCH
+printf '\033[?25l' # hide the cursor for the life of the loop
+
+# Between ticks: with a keyboard, `read -t` on it doubles as the sleep
+# and wakes early on a keypress (so `?` and `q` respond at once). Without
+# one, a fd opened read-write on a pipe never sees EOF, so `read -t` on
+# it blocks for exactly the timeout -- the fork-free sleep from
+# scripts/vest-viz. Either way: no /bin/sleep. A keyboard read that
+# returns EOF instead of timing out (status <= 128: stdin was a tty that
+# went away) switches to the pipe permanently rather than spinning.
+key=""
+nap_tick() {
+	key=""
+	read -t "$1" -u "$tick_fd" -r _ || true
+}
+key_tick() {
+	key=""
+	IFS= read -r -s -n 1 -t "$1" key && return 0
+	local st=$?
+	key=""
+	if ((st <= 128)); then
+		interactive=0
+		exec {tick_fd}<> <(:)
+		wait_tick() { nap_tick "$1"; }
+		nap_tick "$1"
+	fi
+	return 0
+}
+if [[ -t 0 ]]; then
+	interactive=1
+	wait_tick() { key_tick "$1"; }
+else
+	exec {tick_fd}<> <(:)
+	wait_tick() { nap_tick "$1"; }
+fi
+
+while true; do
+	if ((winch)); then
+		winch=0
+		term_size
+	fi
+	if [[ -f $legend ]]; then
+		if read_legend; then ok=1; else ok=0; fi
+	else
+		ok=0
+	fi
+	if ((have)); then
+		if [[ $mode == desc ]]; then render_desc; else render_grid; fi
+	elif [[ -f $legend ]]; then
+		L=(" waiting for a readable snapshot in ${legend/#"$HOME"/\~}")
+	else
+		L=(" waiting for ${legend/#"$HOME"/\~} -- is efferent.service running?")
+	fi
+	paint
+	((once)) && break
+	wait_tick "$poll"
+	case $key in
+	q | Q) break ;;
+	'?' | h | H)
+		if [[ $mode == desc ]]; then mode=grid; else mode=desc; fi
+		;;
+	esac
+done

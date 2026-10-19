@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# mixer-viz: a live view of the vest/Hue mixer -- exactly what
+# mixer_state.json (mixer.go's recordMixerStateViz) says every MIDImix
+# strip and the master fader are doing right now. Sibling to vest-viz
+# (which shows the final, already-blended per-motor frame on the wire) and
+# fleet-legend-tui (which shows the Launchpad's session grid) -- same
+# rigor, same reasons: one jq call per tick, staleness detected from the
+# state file's own timestamp rather than assumed, DEC 2026 synchronized
+# redraw so a clear+redraw every tick never shows a blank frame, and no
+# forks beyond that one jq call per tick.
+#
+# What this shows that vest-viz can't: vest-viz only ever sees the final
+# blended frame -- it has no way to tell "fleet-breath is muted and
+# nothing else is assigned" apart from "the vest is silent for some other
+# reason." This reads mixer.go's control state directly instead: each of
+# the 8 physical strips' assigned channel name (or unassigned), gain,
+# mute, solo, and three dial values, plus the master fader -- and marks
+# which channels are actually contributing to the blend right now by the
+# exact rule blend() itself applies (mixer.go): unmuted, gain > 0, and --
+# if anything is soloed -- also soloed.
+#
+#   mixer-viz          live view, redraws each $poll seconds; Ctrl-C quits
+#   mixer-viz --once   draw one frame and exit
+set -euo pipefail
+
+state="${MIXER_STATE_JSON:-${XDG_STATE_HOME:-$HOME/.local/state}/efferent/mixer_state.json}"
+poll=1        # seconds between reads -- mixerLoop writes at <=10Hz
+              # (mixerStateVizMinInterval, mixer.go); nothing reading a
+              # live debug view needs faster than that, same reasoning
+              # vest-viz's own poll uses.
+stale_ms=3000 # mixerLoop writes mixer_state.json every tick regardless of
+              # vest or MIDImix connectivity, so a gap this long means the
+              # daemon itself stopped, not just every channel going quiet.
+
+once=0
+case "${1:-}" in
+"") ;;
+-1 | --once) once=1 ;;
+-h | --help)
+	sed -n '/^#   mixer-viz/,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
+	exit 0
+	;;
+*)
+	echo "usage: mixer-viz [--once]" >&2
+	exit 2
+	;;
+esac
+
+# The one jq call per tick. Every value is scaled to integer millis (x1000)
+# so the rest of the script is pure bash integer arithmetic -- no float
+# comparisons, no extra forks to a calculator, same convention vest-viz
+# uses for motor values (already integers there) applied here to floats.
+# Fields are joined with US (0x1f) rather than tab -- fleet-legend-tui's
+# own header names why: tab is IFS whitespace, so `read` collapses a
+# leading empty field before a tab, shifting every field after it. An
+# unassigned channel's name is exactly that empty field, every tick.
+# Line 1: timestamp, its epoch seconds (-1 if unparseable), master*1000.
+# Then one line per channel, strip order (index 0 = leftmost physical
+# fader) -- name (empty = unassigned), gain*1000, mute, solo, three
+# dial*1000 values.
+filter='(.timestamp) as $t
+  | ([$t, ($t | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch -1),
+      (.master * 1000 | round)] | join("")),
+    (.channels[] | [(.name // ""), (.gain * 1000 | round), .mute, .solo,
+                    (.dial[0] * 1000 | round), (.dial[1] * 1000 | round),
+                    (.dial[2] * 1000 | round)] | join(""))'
+
+reset=$'\033[0m'
+bold=$'\033[1m'
+c_dim=$'\033[38;5;240m'
+c_grey=$'\033[38;5;245m'
+c_live=$'\033[1;30;42m'    # black on green
+c_stale=$'\033[1;97;41m'   # white on red
+c_stale_fg=$'\033[1;38;5;196m'
+c_warn=$'\033[1;30;43m'    # black on yellow
+c_mute=$'\033[38;5;240m'   # muted or gain 0: excluded from the blend
+c_on=$'\033[1;38;5;76m'    # green: unmuted, gain > 0, actually contributing
+c_solo=$'\033[1;38;5;220m' # amber: soloed (and contributing)
+c_silenced=$'\033[38;5;245m' # dim: unmuted but another channel's solo excludes it
+c_unassigned=$'\033[38;5;238m'
+
+# fmt_dur sets $_dur to a short human duration for a millisecond count.
+# Same helper as scripts/vest-viz -- kept identical rather than sourced,
+# matching that script's own precedent of a small self-contained file.
+fmt_dur() {
+	local ms=$1
+	((ms < 0)) && ms=0
+	if ((ms < 10000)); then
+		printf -v _dur '%d.%02ds' $((ms / 1000)) $((ms % 1000 / 10))
+	elif ((ms < 60000)); then
+		printf -v _dur '%d.%ds' $((ms / 1000)) $((ms % 1000 / 100))
+	else
+		printf -v _dur '%dm%02ds' $((ms / 60000)) $((ms % 60000 / 1000))
+	fi
+	return 0
+}
+
+# now_ms sets $_now_ms from bash's EPOCHREALTIME builtin. No fork.
+now_ms() {
+	local t=$EPOCHREALTIME
+	_now_ms=$((${t%.*} * 1000 + 10#${t#*.} / 1000))
+}
+
+# term_width sets COLUMNS from the controlling tty (one stty fork), or 80
+# with no tty. Called once at startup and again only after a SIGWINCH.
+term_width() {
+	local l c
+	if read -r l c < <(stty size 2>/dev/null </dev/tty) && [[ $c =~ ^[0-9]+$ ]]; then
+		COLUMNS=$c
+	else
+		COLUMNS=80
+	fi
+}
+
+# bar10 sets $_bar to a 10-char bar for a millis value (0-1000).
+bar10() {
+	local v=$1 filled=0 i
+	((v < 0)) && v=0
+	((v > 1000)) && v=1000
+	filled=$((v / 100))
+	_bar=""
+	for ((i = 0; i < 10; i++)); do
+		if ((i < filled)); then _bar+="█"; else _bar+="·"; fi
+	done
+}
+
+# fmt2 sets $_v to a millis value (possibly negative) formatted as N.NN.
+fmt2() {
+	local v=$1 neg=""
+	((v < 0)) && { neg="-"; v=$((-v)); }
+	printf -v _v '%s%d.%02d' "$neg" $((v / 1000)) $(((v % 1000) / 10))
+}
+
+# out appends a formatted segment to the tick's frame buffer instead of
+# printing directly -- one write per tick, same reason vest-viz's own out()
+# gives: real wall-clock time between separate printf calls to stdout can
+# let the terminal paint a just-cleared screen before the content arrives.
+out() {
+	local seg
+	printf -v seg "$@"
+	frame+=$seg
+}
+
+# read_state runs the one jq call and, on success, replaces ts/epoch/master
+# and the per-channel arrays. Returns 1 on a torn or missing file, leaving
+# the previous snapshot in place (writeJSON renames atomically, so this is
+# cheap insurance, not an expected path).
+declare -a cn=() cg=() cm=() cs=() cd0=() cd1=() cd2=()
+read_state() {
+	local nts="" nepoch=-1 nmaster=0 i=0
+	{
+		IFS=$'\x1f' read -r nts nepoch nmaster || return 1
+		for ((i = 0; i < 8; i++)); do
+			IFS=$'\x1f' read -r cn[i] cg[i] cm[i] cs[i] cd0[i] cd1[i] cd2[i] || return 1
+		done
+	} < <(jq -r "$filter" "$state" 2>/dev/null)
+	[[ $nepoch =~ ^-?[0-9]+$ ]] || return 1
+	ts=$nts epoch=$nepoch master=$nmaster
+	return 0
+}
+
+render() {
+	fmt_dur "$age_ms"
+	if ((stale)); then
+		out ' %s ✖ STALE  no write for %s %s %sthe mixer loop isn'"'"'t writing -- daemon idle or gone%s\n' \
+			"$c_stale" "$_dur" "$reset" "$c_stale_fg" "$reset"
+	else
+		out ' %s ● LIVE %s updated %s ago%s\n' "$c_live" "$reset" "$_dur" "$reset"
+	fi
+	if ((!ok)); then
+		out ' %s ⚠ frame unreadable this tick -- showing the previous one %s\n' "$c_warn" "$reset"
+	fi
+	out '\n'
+
+	bar10 "$master"
+	fmt2 "$master"
+	out ' %smaster%s  %s  %s\n\n' "$bold" "$reset" "$_bar" "$_v"
+
+	# Column widths below are exact, not decorative: the "lead" (mark +
+	# index) is always 4 chars, the gain blob is always 16 (10-char bar +
+	# space + 5-wide value field), and the dial blob is always 18
+	# (three 4-char "N.NN" values -- gain/dial are always 0.00-1.00, so
+	# fmt2 never emits a variable-width or negative result here -- joined
+	# by two 3-char " / " separators). A single literal space separates
+	# each field from the next; getting any of these three numbers wrong
+	# desyncs the header from the row it's labeling without erroring.
+	out ' %s%-4s %-16s %-16s %-18s %s%s\n' "$bold" "ch" "channel" "gain" "dial 1 / 2 / 3" "flags" "$reset"
+
+	# any_solo mirrors blend()'s own rule in mixer.go: a soloed channel only
+	# triggers exclusivity if it could actually contribute anyway.
+	local any_solo=0 i
+	for ((i = 0; i < 8; i++)); do
+		if [[ ${cs[i]} == true && ${cm[i]} == false && ${cg[i]} -gt 0 ]]; then
+			any_solo=1
+		fi
+	done
+
+	local name muted solo gain color mark flags d0 d1 d2
+	for ((i = 0; i < 8; i++)); do
+		name=${cn[i]:-} muted=${cm[i]} solo=${cs[i]} gain=${cg[i]}
+		if [[ -z $name ]]; then
+			color=$c_unassigned mark="·"
+		elif [[ $muted == true || $gain -le 0 ]]; then
+			color=$c_mute mark="○"
+		elif ((any_solo)) && [[ $solo != true ]]; then
+			color=$c_silenced mark="○"
+		elif [[ $solo == true ]]; then
+			color=$c_solo mark="●"
+		else
+			color=$c_on mark="●"
+		fi
+		bar10 "$gain"
+		fmt2 "$gain"
+		local lead gainblob dialblob
+		printf -v lead '%s %d ' "$mark" "$i" # always 4 chars: mark is 1, i is always a single digit 0-7
+		printf -v gainblob '%s %-5s' "$_bar" "$_v" # 10 + 1 + 5 = 16
+		fmt2 "${cd0[i]}"
+		d0=$_v
+		fmt2 "${cd1[i]}"
+		d1=$_v
+		fmt2 "${cd2[i]}"
+		d2=$_v
+		printf -v dialblob '%s / %s / %s' "$d0" "$d1" "$d2" # 4+3+4+3+4 = 18
+		flags=""
+		[[ $muted == true ]] && flags+="MUTE "
+		[[ $solo == true ]] && flags+="SOLO "
+		out ' %s%-4s %-16s %s %s %s%s\n' \
+			"$color" "$lead" "${name:---}" "$gainblob" "$dialblob" "$flags" "$reset"
+	done
+
+	out '\n %s● contributing to the blend right now · ○ excluded (muted, gain 0, or another channel'"'"'s solo) · · unassigned%s\n' \
+		"$c_dim" "$reset"
+	if ((any_solo)); then
+		out ' %sa channel is soloed -- every non-soloed channel is excluded right now%s\n' "$c_warn" "$reset"
+	fi
+	out ' %sdial 1/2/3: raw MIDImix knob values, 0.00-1.00 -- fleet-breath reads them; machine'"'"'s-breath ignores them%s\n' \
+		"$c_dim" "$reset"
+}
+
+cleanup() { printf '\033[?2026l\033[?25h\033[0m\n'; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+winch=1
+trap 'winch=1' WINCH
+printf '\033[?25l'
+
+# Fork-free sleep, identical trick to scripts/vest-viz: a fd opened
+# read-write on a pipe never sees EOF, so `read -t` on it blocks for
+# exactly the timeout instead of forking /bin/sleep.
+exec {tick_fd}<> <(:)
+nap() { read -t "$1" -u "$tick_fd" -r _ || true; }
+now_ms
+t0=$_now_ms
+nap 0.05
+now_ms
+if ((_now_ms - t0 < 40)); then
+	nap() { sleep "$1"; }
+fi
+
+ts="" epoch=-1 master=0 ok=0 stale=0
+term_width
+
+while true; do
+	if ((winch)); then
+		winch=0
+		term_width
+	fi
+	frame=""
+	if [[ ! -f $state ]]; then
+		out '%s\n' " waiting for ${state/#"$HOME"/\~} -- has the mixer loop started (MIDImix connected)?"
+	else
+		if read_state; then ok=1; else ok=0; fi
+		if [[ -z $ts ]]; then
+			out '%s\n' " waiting for a readable frame in ${state/#"$HOME"/\~}"
+		else
+			now_ms
+			age_ms=$((_now_ms - epoch * 1000))
+			stale=0
+			((age_ms > stale_ms)) && stale=1
+			render
+		fi
+	fi
+	printf '\033[?2026h\033[H\033[2J%s\033[?2026l' "$frame"
+	((once)) && break
+	nap "$poll"
+done

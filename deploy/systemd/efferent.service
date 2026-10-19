@@ -1,0 +1,27 @@
+[Unit]
+Description=efferent -- biofeedback actuator daemon (Hue lights, haptic vest)
+# Bluetooth: vest.go talks to the vest over BlueZ/D-Bus. Network: Hue is a
+# LAN HTTP bridge, but bridge re-resolution can also hit Philips' cloud
+# discovery endpoint (see resolveBridge in main.go) -- wait for both.
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+# @SRCDIR@ and @GOBIN@ are substituted by `make service-install`.
+WorkingDirectory=@SRCDIR@
+# Rebuilds on every start/restart so no start path can run stale code.
+# systemd --user's own PATH doesn't carry a per-version Go SDK install's bin
+# dir, hence the @GOBIN@ placeholder instead of a bare name.
+ExecStartPre=/bin/sh -c '@GOBIN@ build -ldflags "-X main.buildInfo=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)$(git diff --quiet 2>/dev/null || echo -dirty)-$(date -u +%%Y%%m%%dT%%H%%M%%SZ)" -o %h/go/bin/efferent .'
+ExecStart=%h/go/bin/efferent
+Restart=on-failure
+RestartSec=5s
+# On stop, efferent silences the vest (SIGTERM handler); give it time.
+TimeoutStopSec=5s
+# efferent never needs to gain privileges. Stronger sandboxing
+# (ProtectSystem=, PrivateTmp=) is left off: it needs user namespaces, which
+# some distributions restrict, and the rebuild step writes to the Go caches.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
