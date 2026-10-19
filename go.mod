@@ -1,10 +1,10 @@
 module efferent
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0
-	golang.org/x/sys v0.13.0
+	golang.org/x/sys v0.49.0
 	tinygo.org/x/bluetooth v0.16.0
 )
 
